@@ -32,10 +32,28 @@ type DetectorConstructor = new (options: { formats: string[] }) => Detector;
 
 const PAIRING_CODE_PREFIX = "nostrpair://";
 
+// Safari (iPhone) has no BarcodeDetector: decode camera frames with jsQR,
+// loaded only there.
+class FrameDetector {
+  private canvas = document.createElement("canvas");
+  async detect(source: HTMLVideoElement) {
+    const { default: jsQR } = await import("jsqr");
+    const { videoWidth: width, videoHeight: height } = source;
+    if (!width || !height) return [];
+    Object.assign(this.canvas, { width, height });
+    const context = this.canvas.getContext("2d", { willReadFrequently: true });
+    context?.drawImage(source, 0, 0, width, height);
+    const frame = context?.getImageData(0, 0, width, height);
+    const code = frame && jsQR(frame.data, width, height);
+    return code ? [{ rawValue: code.data }] : [];
+  }
+}
+
 function barcodeDetector(): DetectorConstructor | null {
+  if (!navigator.mediaDevices?.getUserMedia) return null;
   return (
     (window as { BarcodeDetector?: DetectorConstructor }).BarcodeDetector ??
-    null
+    FrameDetector
   );
 }
 
