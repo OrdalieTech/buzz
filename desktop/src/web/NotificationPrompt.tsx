@@ -49,7 +49,16 @@ export default function NotificationPrompt({
   // After the app shell's own effects have started listening for taps.
   React.useEffect(() => void setTimeout(flushLaunchNotificationTarget), []);
   // Background push follows the notification setting (see web/push.ts).
-  React.useEffect(() => void syncLease(enabled), [enabled]);
+  React.useEffect(() => {
+    // An installed app stays open for days: refresh the lease when it comes
+    // back, so new DMs and a renewed push endpoint are covered (no-op when
+    // nothing changed).
+    const refresh = () =>
+      document.visibilityState === "visible" && void syncLease(enabled);
+    refresh();
+    document.addEventListener("visibilitychange", refresh);
+    return () => document.removeEventListener("visibilitychange", refresh);
+  }, [enabled]);
   const [busy, setBusy] = React.useState(false);
   const homeScreen = needsHomeScreenForNotifications();
   const close = () => dismissNotificationOffer();
