@@ -35,12 +35,18 @@ function haptic(ms = 10) {
 
 // Android resizes the layout for the keyboard only when asked; iOS ignores
 // this and is handled by following the visual viewport below.
+// iOS zooms into any field under 16px on focus; maximum-scale stops that
+// and iOS still lets people pinch-zoom. Android would lose pinch-zoom with
+// it, and doesn't zoom on focus anyway, so it's iOS only (iPads report Mac).
+const IOS =
+  /iP(hone|ad|od)/.test(navigator.userAgent) ||
+  (navigator.maxTouchPoints > 1 && /Mac/.test(navigator.userAgent));
 function configureViewport() {
   document
     .querySelector('meta[name="viewport"]')
     ?.setAttribute(
       "content",
-      "width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content",
+      `width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content${IOS ? ", maximum-scale=1" : ""}`,
     );
 }
 
