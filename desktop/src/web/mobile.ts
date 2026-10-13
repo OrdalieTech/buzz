@@ -396,8 +396,19 @@ function swipeToReply() {
     (event) => {
       const point = event.touches[0];
       const row = (event.target as Element).closest<HTMLElement>(ROW);
+      // A finger on a code block or wide table scrolls it instead.
+      let el = event.target as Element | null;
+      while (
+        el &&
+        el !== row &&
+        !(
+          el.scrollWidth > el.clientWidth &&
+          /auto|scroll/.test(getComputedStyle(el).overflowX)
+        )
+      )
+        el = el.parentElement;
       swipe =
-        phone.matches && row && event.touches.length === 1
+        phone.matches && row && el === row && event.touches.length === 1
           ? { row, x: point.clientX, y: point.clientY, dx: 0, axis: null }
           : null;
     },
