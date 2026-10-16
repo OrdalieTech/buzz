@@ -20,6 +20,8 @@ services:
       WEBPUSH_DELIVERY_URL: http://webpush:8080/v1/deliveries/apns
       WEBPUSH_PUBLIC_ORIGIN: ${BUZZ_DOMAIN:?set BUZZ_DOMAIN}
       WEBPUSH_ALLOWED_HOSTS: ${WEBPUSH_ALLOWED_HOSTS:-}
+      # Presence: no wake while the user is online elsewhere.
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379
     volumes:
       - buzz-webpush-data:/data
     restart: unless-stopped

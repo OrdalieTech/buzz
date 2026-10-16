@@ -13,12 +13,16 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { dirname } from "node:path";
 import { verifyEvent } from "nostr-tools/pure";
+import { createClient } from "redis";
 import webpush from "web-push";
 
 const MAX_BODY = 16 * 1024;
 const MAX_PER_PUBKEY = 10;
 const MAX_GRANTS = 10_000;
 const MAX_WAKE_TTL = 3600;
+// First retry delay asked of the relay while the user is online; its backoff
+// doubles it per attempt (15 s, 45 s, 1.75 min, … 32 min after the message).
+const DEFER_SECONDS = 15;
 const AUTH_WINDOW_SECONDS = 60;
 // Browser push services (Chrome, Chromium builds, Safari, Firefox, Edge).
 const PUSH_HOSTS = [
@@ -38,6 +42,7 @@ export function createGateway({
   allowedHosts = PUSH_HOSTS,
   send = (subscription, payload, options) =>
     webpush.sendNotification(subscription, payload, options),
+  isOnline = async () => false,
   now = () => Math.floor(Date.now() / 1000),
 }) {
   let grants = {};
@@ -158,6 +163,12 @@ export function createGateway({
     if (!record) return invalid(grant);
     const ttl = Math.min(MAX_WAKE_TTL, Number(expires_at) - now());
     if (!(ttl > 0)) return [200, { status: "accepted" }];
+    // Someone active on another device (Buzz desktop, or the app open on this
+    // phone) sees the message there. The relay retries with backoff, so the
+    // wake lands once they go away, or is dropped when the message is an hour
+    // old; the service worker then skips what they have read meanwhile.
+    if (await isOnline(record.pubkey).catch(() => false))
+      return [503, { status: "retry", retry_after_seconds: DEFER_SECONDS }];
     try {
       // One collapsible topic: a phone back online gets one wake, not a burst.
       await send(
@@ -201,11 +212,12 @@ export function createGateway({
     if (pathname === "/v1/deliveries/apns") {
       if (authenticate(auth, deliveryUrl, body) !== relayPubkey)
         return [401, { error: "unauthorized" }];
-      // The relay may retry a request; answer it the same way once.
+      // The relay may retry a request; answer it the same way once. A retry
+      // answer is not final, so the next attempt is decided afresh.
       const cached = deliveries.get(json.request_id);
       if (cached) return cached;
       const response = await deliver(json);
-      deliveries.set(json.request_id, response);
+      if (response[0] !== 503) deliveries.set(json.request_id, response);
       if (deliveries.size > 5000)
         deliveries.delete(deliveries.keys().next().value);
       return response;
@@ -244,6 +256,20 @@ export function createGateway({
   return { load, handler, grants: () => grants };
 }
 
+// The relay keeps presence in Redis as buzz:<community>:presence:<pubkey>
+// ("online" or "away", 180 s TTL; crates/buzz-pubsub/src/presence.rs).
+// Unreachable Redis reads as offline, so wakes go out as before.
+export function redisPresence(url) {
+  const client = createClient({ url });
+  client.on("error", (error) => console.warn(`redis: ${error.message}`));
+  client.connect().catch(() => {});
+  return async (pubkey) => {
+    if (!client.isReady) return false;
+    const keys = await client.keys(`buzz:*:presence:${pubkey}`);
+    return keys.length > 0 && (await client.mGet(keys)).includes("online");
+  };
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
   const env = (name) => {
     const value = process.env[name];
@@ -268,6 +294,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     allowedHosts: process.env.WEBPUSH_ALLOWED_HOSTS
       ? process.env.WEBPUSH_ALLOWED_HOSTS.split(",")
       : PUSH_HOSTS,
+    isOnline: process.env.REDIS_URL
+      ? redisPresence(process.env.REDIS_URL)
+      : undefined,
   });
   await gateway.load();
   createServer(gateway.handler).listen(Number(process.env.PORT || 8080));

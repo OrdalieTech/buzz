@@ -27,6 +27,8 @@ function auth(key, url, body) {
         ["u", url],
         ["method", "POST"],
         ["payload", createHash("sha256").update(body).digest("hex")],
+        // Retries are signed afresh, as the relay does.
+        ["nonce", crypto.randomUUID()],
       ],
     },
     key,
@@ -34,9 +36,10 @@ function auth(key, url, body) {
   return `Nostr ${Buffer.from(JSON.stringify(event)).toString("base64")}`;
 }
 
-async function start(send) {
+async function start(send, isOnline) {
   const sent = [];
   const gateway = createGateway({
+    isOnline,
     relayPubkey: getPublicKey(relayKey),
     deliveryUrl: DELIVERY_URL,
     publicOrigin: ORIGIN,
@@ -164,5 +167,21 @@ test("a throttled push service asks the relay to retry", async () => {
     503,
     { status: "retry", retry_after_seconds: 12 },
   ]);
+  gw.close();
+});
+
+test("a user online elsewhere gets no wake until they go away", async () => {
+  let online = true;
+  const gw = await start(undefined, async () => online);
+  const [, { endpoint_grant }] = await gw.register();
+  const id = crypto.randomUUID();
+  assert.deepEqual(await gw.deliver(endpoint_grant, id), [
+    503,
+    { status: "retry", retry_after_seconds: 15 },
+  ]);
+  assert.equal(gw.sent.length, 0);
+  online = false;
+  assert.deepEqual(await gw.deliver(endpoint_grant, id), [200, { status: "accepted" }]);
+  assert.equal(gw.sent.length, 1);
   gw.close();
 });

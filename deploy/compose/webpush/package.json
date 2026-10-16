@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "nostr-tools": "^2.23.3",
+    "redis": "^5.12.1",
     "web-push": "^3.6.7"
   }
 }

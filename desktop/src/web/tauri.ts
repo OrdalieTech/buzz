@@ -983,7 +983,12 @@ export async function invoke<T>(
       return info.supported_nips?.includes(43) as T;
     }
     case "get_os_idle_seconds":
-      return null as T;
+      // A phone app out of sight means its user is away from it. Presence
+      // follows, so the push gateway does not hold back this phone's wakes
+      // (deploy/compose/webpush).
+      return (
+        document.hidden && matchMedia("(pointer: coarse)").matches ? 3600 : null
+      ) as T;
     case "list_managed_agents":
     case "list_managed_agent_runtimes":
     case "list_personas":

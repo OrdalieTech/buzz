@@ -2,8 +2,17 @@
 // Service worker for the browser build, bundled to /sw.js by vite.web.ts:
 // authenticated relay media, notification taps, and push wakes.
 
+import * as nip44 from "nostr-tools/nip44";
 import { finalizeEvent, verifyEvent } from "nostr-tools/pure";
 
+import {
+  maxReadAt,
+  msgContextKey,
+} from "@/features/channels/readState/readStateFormat";
+import {
+  getThreadReference,
+  isBroadcastReply,
+} from "@/features/messages/lib/threading";
 import {
   encoder,
   loadIdentity,
@@ -17,6 +26,8 @@ declare const self: ServiceWorkerGlobalScope;
 
 const ICON = "/app-icon@2x.png";
 const MAX_SHOWN_PER_WAKE = 3;
+// Lines kept in one channel's notification.
+const MAX_LINES = 4;
 // Wakes are only useful for an hour (the relay drops older ones too).
 const LOOKBACK_SECONDS = 3600;
 
@@ -132,14 +143,29 @@ self.addEventListener("notificationclick", (event) => {
 // for every push, so fall back to a generic one when that is not possible.
 self.addEventListener("push", (event) => event.waitUntil(showWake()));
 
+// The open app asks for a sweep when it is shown or hidden (see
+// NotificationPrompt.tsx). The wait lets its read state, published 5 s
+// after the last read, reach the relay first.
+self.addEventListener("message", (event) => {
+  if (event.data?.type !== "buzz-close-read") return;
+  event.waitUntil(
+    (async () => {
+      await new Promise((done) => setTimeout(done, 6000));
+      const context = await readPushContext();
+      const key = context && (await loadIdentity());
+      if (context && key) await closeRead(await readMarkers(context, key));
+    })().catch((error) => console.warn("[sw] read sweep failed:", error)),
+  );
+});
+
 async function showWake() {
-  let shown = 0;
+  let handled = false;
   try {
-    shown = await showNewMessages();
+    handled = await showNewMessages();
   } catch (error) {
     console.warn("[sw] push fetch failed:", error);
   }
-  if (shown === 0)
+  if (!handled)
     await self.registration.showNotification("Buzz", {
       body: "You have new messages",
       icon: ICON,
@@ -147,56 +173,155 @@ async function showWake() {
     });
 }
 
-async function showNewMessages(): Promise<number> {
+async function showNewMessages(): Promise<boolean> {
   const context = await readPushContext();
   const key = context && (await loadIdentity());
-  if (!context || !key) return 0;
+  if (!context || !key) return false;
   const now = Math.floor(Date.now() / 1000);
   const since = Math.max(context.lastSeen ?? 0, now - LOOKBACK_SECONDS);
-  const events = await query(
-    context,
-    key,
-    context.filters.map((filter) => ({ ...filter, since, limit: 10 })),
-  );
+  const [events, markers] = await Promise.all([
+    query(
+      context,
+      key,
+      context.filters.map((filter) => ({ ...filter, since, limit: 10 })),
+    ),
+    readMarkers(context, key),
+  ]);
   const byId = new Map(
     events
       .filter((event) => event.pubkey !== context.pubkey && verifyEvent(event))
       .map((event) => [event.id, event]),
   );
   const newest = [...byId.values()].sort((a, b) => b.created_at - a.created_at);
-  if (newest.length === 0) return 0;
+  if (newest.length === 0) return false;
+  await closeRead(markers);
   const notified = new Set(context.notified);
-  const fresh = newest.filter((event) => !notified.has(event.id));
-  // Already shown (by the open app or an earlier wake): refresh it in place.
-  const toShow = (fresh.length ? fresh : newest).slice(0, MAX_SHOWN_PER_WAKE);
-  const names = await profileNames(
-    context,
-    key,
-    toShow.map((event) => event.pubkey),
-  );
-  for (const event of toShow.reverse()) {
-    const channelId = event.tags.find((tag) => tag[0] === "h")?.[1] ?? null;
-    const channel = channelId ? context.channels[channelId] : undefined;
-    const sender = names.get(event.pubkey) ?? "Someone";
-    await self.registration.showNotification(
-      channel && !channel.dm && channel.name
-        ? `${sender} in #${channel.name}`
-        : sender,
-      {
-        body: messagePreview(event.content),
-        data: { target: { eventId: event.id, channelId } },
-        icon: ICON,
-        tag: event.id,
-        timestamp: event.created_at * 1000,
-      } as NotificationOptions,
-    );
-  }
+  const toShow = newest
+    .filter((event) => !notified.has(event.id))
+    .map(lineOf)
+    .filter((line) => !isRead(markers, line))
+    .slice(0, MAX_SHOWN_PER_WAKE);
   await writePushContext({
     ...context,
     lastSeen: Math.max(since, newest[0].created_at),
-    notified: [...toShow.map((event) => event.id), ...notified].slice(0, 200),
+    notified: [...toShow.map((line) => line.id), ...notified].slice(0, 200),
   });
-  return toShow.length;
+  if (toShow.length === 0) {
+    // Already read on another device or already shown. Browsers still require
+    // a notification for every push (iOS revokes the subscription after a
+    // few silent ones), so show one quietly and take it straight back.
+    await self.registration.showNotification("Buzz", {
+      icon: ICON,
+      silent: true,
+      tag: "buzz-wake",
+    });
+    for (const notification of await self.registration.getNotifications({
+      tag: "buzz-wake",
+    }))
+      notification.close();
+    return true;
+  }
+  const names = await profileNames(
+    context,
+    key,
+    toShow.map((line) => line.pubkey),
+  );
+  for (const line of toShow.reverse()) {
+    const channel = line.channelId ? context.channels[line.channelId] : null;
+    const sender = names.get(line.pubkey) ?? "Someone";
+    const title =
+      channel && !channel.dm && channel.name ? `#${channel.name}` : sender;
+    const text = messagePreview(line.content);
+    // One notification per channel: a new message joins its unread lines.
+    const tag = line.channelId ?? line.id;
+    const [previous] = await self.registration.getNotifications({ tag });
+    const lines = [
+      ...(previous?.data?.lines ?? []).filter(
+        (old: Line) => !isRead(markers, old),
+      ),
+      { ...line, content: title === sender ? text : `${sender}: ${text}` },
+    ].slice(-MAX_LINES);
+    await self.registration.showNotification(title, {
+      body: lines.map((entry) => entry.content).join("\n"),
+      data: {
+        target: { eventId: line.id, channelId: line.channelId },
+        lines,
+      },
+      icon: ICON,
+      renotify: true,
+      tag,
+      timestamp: line.createdAt * 1000,
+    } as NotificationOptions);
+  }
+  return true;
+}
+
+type Line = {
+  id: string;
+  pubkey: string;
+  content: string;
+  channelId: string | null;
+  rootId: string | null;
+  createdAt: number;
+};
+
+function lineOf(event: RelayEvent): Line {
+  return {
+    id: event.id,
+    pubkey: event.pubkey,
+    content: event.content,
+    channelId: event.tags.find((tag) => tag[0] === "h")?.[1] ?? null,
+    rootId: isBroadcastReply(event.tags)
+      ? null
+      : getThreadReference(event.tags).rootId,
+    createdAt: event.created_at,
+  };
+}
+
+// Same rule as the app's unread badges (communityUnreadObserver.ts): read
+// once the channel, its thread or the message itself is marked past it.
+function isRead(markers: Map<string, number>, line: Line) {
+  const readAt = maxReadAt(
+    (line.channelId && markers.get(line.channelId)) || null,
+    markers.get(msgContextKey(line.id)) ?? null,
+    (line.rootId && markers.get(`thread:${line.rootId}`)) || null,
+  );
+  return readAt !== null && line.createdAt <= readAt;
+}
+
+// The user's read markers from every device: NIP-RS kind-30078 blobs
+// encrypted to themselves, merged newest-wins. Unreadable means nothing read,
+// so a failure here never hides a message.
+async function readMarkers(context: PushContext, key: Uint8Array) {
+  const events = await query(context, key, [
+    {
+      kinds: [30078],
+      authors: [context.pubkey],
+      "#t": ["read-state"],
+      limit: 100,
+    },
+  ]).catch(() => []);
+  const conversationKey = nip44.getConversationKey(key, context.pubkey);
+  const markers = new Map<string, number>();
+  for (const event of events)
+    try {
+      const { contexts } = JSON.parse(
+        nip44.decrypt(event.content, conversationKey),
+      );
+      for (const [id, at] of Object.entries(contexts ?? {}))
+        if (typeof at === "number" && at > (markers.get(id) ?? 0))
+          markers.set(id, at);
+    } catch {}
+  return markers;
+}
+
+// Close the notifications whose every line has been read since.
+async function closeRead(markers: Map<string, number>) {
+  for (const notification of await self.registration.getNotifications()) {
+    const lines: Line[] | undefined = notification.data?.lines;
+    if (lines?.length && lines.every((line) => isRead(markers, line)))
+      notification.close();
+  }
 }
 
 async function profileNames(

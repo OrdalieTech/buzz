@@ -52,9 +52,14 @@ export default function NotificationPrompt({
   React.useEffect(() => {
     // An installed app stays open for days: refresh the lease when it comes
     // back, so new DMs and a renewed push endpoint are covered (no-op when
-    // nothing changed).
-    const refresh = () =>
-      document.visibilityState === "visible" && void syncLease(enabled);
+    // nothing changed). Either way, let the service worker close the
+    // notifications read since, here or on another device.
+    const refresh = () => {
+      navigator.serviceWorker?.controller?.postMessage({
+        type: "buzz-close-read",
+      });
+      if (document.visibilityState === "visible") void syncLease(enabled);
+    };
     refresh();
     document.addEventListener("visibilitychange", refresh);
     return () => document.removeEventListener("visibilitychange", refresh);
