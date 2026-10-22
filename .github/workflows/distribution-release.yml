@@ -7,6 +7,8 @@ on:
   push:
     tags:
       - 'dist-v[0-9]*'
+  # Re-run a tag by hand: gh workflow run distribution-release.yml --ref dist-v<semver>
+  workflow_dispatch:
 
 concurrency:
   group: distribution-release-${{ github.ref }}
