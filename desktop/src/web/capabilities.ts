@@ -57,7 +57,7 @@ export function withBrowserDefaults<
 export const defaultThemeName = isWebBuild ? "slack-ochin" : "buzz";
 
 // The PWA serves one organisation from its own domain: name the community
-// after it (chat.ordalie.com → "Ordalie") rather than the first host label.
+// after it (chat.example.com → "Example") rather than the first host label.
 export function browserCommunityName(hostname: string): string | null {
   if (!isWebBuild || hostname !== location.hostname) return null;
   const label = hostname.split(".").at(-2) ?? hostname;

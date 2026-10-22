@@ -13,7 +13,7 @@ const shim = path.resolve(__dirname, "src/web/tauri.ts");
 const head = `
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-    <meta name="description" content="Ordalie team chat" />
+    <meta name="description" content="Team chat for people and agents" />
     <meta name="theme-color" content="#000000" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -80,7 +80,7 @@ export function buzzWeb(): Plugin {
       order: "post",
       handler: (html) =>
         html
-          .replace(/<title>.*<\/title>/, "<title>Buzz | Ordalie</title>")
+          .replace(/<title>.*<\/title>/, "<title>Buzz</title>")
           .replace(/href="\/buzz\.svg[^"]*"/, 'href="/favicon.svg"')
           .replace(
             "<head>",

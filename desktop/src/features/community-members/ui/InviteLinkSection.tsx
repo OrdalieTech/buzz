@@ -33,7 +33,7 @@ const MAX_USE_OPTIONS: { label: string; value: number | null }[] = [
   { label: "25 uses", value: 25 },
 ];
 
-// The Ordalie web build defaults invite links to one use within a day, so a
+// The web build defaults invite links to one use within a day, so a
 // forwarded or leaked link cannot admit anyone else.
 export const DEFAULT_INVITE_TTL_SECS = TTL_OPTIONS[isWebBuild ? 0 : 1].value;
 const DEFAULT_INVITE_MAX_USES = isWebBuild ? 1 : null;

@@ -1,8 +1,8 @@
 {
   "id": "/",
-  "name": "Buzz | Ordalie",
+  "name": "Buzz",
   "short_name": "Buzz",
-  "description": "Ordalie team chat",
+  "description": "Team chat for people and agents",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
