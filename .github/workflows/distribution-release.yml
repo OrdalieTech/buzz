@@ -97,7 +97,8 @@ jobs:
           DMG="$(ls "$BUNDLE"/dmg/*.dmg)"
           NAME="${PRODUCT_NAME// /_}"
           cp "$ARCHIVE" "$RUNNER_TEMP/${NAME}_aarch64.app.tar.gz"
+          cp "$DMG" "$RUNNER_TEMP/${NAME}_${VERSION}_aarch64.dmg"
           URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${NAME}_aarch64.app.tar.gz"
           bash desktop/scripts/generate-oss-latest-json.sh "$VERSION" "darwin-aarch64:$ARCHIVE.sig:$URL" > "$RUNNER_TEMP/latest.json"
           gh release create "$GITHUB_REF_NAME" --title "$PRODUCT_NAME $VERSION" --generate-notes \
-            "$DMG" "$RUNNER_TEMP/${NAME}_aarch64.app.tar.gz" "$RUNNER_TEMP/latest.json"
+            "$RUNNER_TEMP/${NAME}_${VERSION}_aarch64.dmg" "$RUNNER_TEMP/${NAME}_aarch64.app.tar.gz" "$RUNNER_TEMP/latest.json"
