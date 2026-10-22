@@ -47,6 +47,12 @@ jobs:
           echo "BUZZ_BUILD_DEMO_SLUG=$(node -e 'console.log(JSON.parse(process.argv[1]).slug)' "$IDENTITY")" >> "$GITHUB_ENV"
           echo "PRODUCT_NAME=$(node -e 'console.log(JSON.parse(process.argv[1]).productName)' "$IDENTITY")" >> "$GITHUB_ENV"
           echo "BUZZ_UPDATER_ENDPOINT=https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/latest.json" >> "$GITHUB_ENV"
+          # The app menu and Cmd-Tab read these, so they must not say plain "Buzz".
+          PLIST="$RUNNER_TEMP/Info.plist"
+          cp desktop/src-tauri/Info.plist "$PLIST"
+          PRODUCT_NAME="$(node -e 'console.log(JSON.parse(process.argv[1]).productName)' "$IDENTITY")"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName $PRODUCT_NAME" -c "Set :CFBundleDisplayName $PRODUCT_NAME" "$PLIST"
+          node -e 'const f=process.argv[1], c=JSON.parse(require("fs").readFileSync(f)); c.bundle.macOS={infoPlist: process.argv[2]}; require("fs").writeFileSync(f, JSON.stringify(c))' "$RUNNER_TEMP/identity.json" "$PLIST"
 
       - name: Generate updater config
         run: cd desktop && node scripts/build-release-config.mjs
@@ -77,7 +83,7 @@ jobs:
 
       - name: Verify signature and notarization
         run: |
-          APP="target/$TARGET/release/bundle/macos/$PRODUCT_NAME.app"
+          APP="desktop/src-tauri/target/$TARGET/release/bundle/macos/$PRODUCT_NAME.app"
           codesign --verify --deep --strict "$APP"
           spctl --assess --type execute -vv "$APP"
           xcrun stapler validate "$APP"
@@ -86,7 +92,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          BUNDLE="target/$TARGET/release/bundle"
+          BUNDLE="desktop/src-tauri/target/$TARGET/release/bundle"
           ARCHIVE="$(ls "$BUNDLE"/macos/*.app.tar.gz)"
           DMG="$(ls "$BUNDLE"/dmg/*.dmg)"
           NAME="${PRODUCT_NAME// /_}"
