@@ -1,0 +1,95 @@
+# Signed macOS release of this distribution. It installs next to the official
+# app: the demo-build identity gives it its own bundle id, keychain service,
+# deep link scheme and data directories, and its updater follows this repo.
+name: Distribution release
+
+on:
+  push:
+    tags:
+      - 'dist-v[0-9]*'
+
+concurrency:
+  group: distribution-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: Plus
+  # Fixed so every release keeps the same identity (keychain, data, deep links).
+  APP_BUILD_ID: 98ac986289f5c660
+  TARGET: aarch64-apple-darwin
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+
+      - name: Install desktop dependencies
+        run: just desktop-install-ci
+
+      - name: Set version and app identity
+        run: |
+          VERSION="${GITHUB_REF_NAME#dist-v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          (cd desktop && node scripts/set-version-from-tag.mjs "$VERSION")
+          (cd desktop/src-tauri && cargo update --workspace)
+          IDENTITY="$(node desktop/scripts/demo-build-config.mjs "$APP_NAME" "$RUNNER_TEMP/identity.json" "$APP_BUILD_ID")"
+          echo "BUZZ_BUILD_DEMO_SLUG=$(node -e 'console.log(JSON.parse(process.argv[1]).slug)' "$IDENTITY")" >> "$GITHUB_ENV"
+          echo "PRODUCT_NAME=$(node -e 'console.log(JSON.parse(process.argv[1]).productName)' "$IDENTITY")" >> "$GITHUB_ENV"
+          echo "BUZZ_UPDATER_ENDPOINT=https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/latest.json" >> "$GITHUB_ENV"
+
+      - name: Generate updater config
+        run: cd desktop && node scripts/build-release-config.mjs
+        env:
+          BUZZ_UPDATER_PUBLIC_KEY: ${{ vars.UPDATER_PUBLIC_KEY }}
+
+      - name: Build sidecars
+        run: |
+          cargo build --release --target "$TARGET" -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
+          ./scripts/bundle-sidecars.sh "$TARGET"
+
+      - name: Build, sign and notarize
+        env:
+          BUZZ_UPDATER_PUBLIC_KEY: ${{ vars.UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.UPDATER_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.UPDATER_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          export APPLE_API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s\n' "$APPLE_API_KEY_CONTENT" > "$APPLE_API_KEY_PATH"
+          cd desktop && pnpm tauri build --ci --target "$TARGET" --bundles app,dmg \
+            --config "$RUNNER_TEMP/identity.json" --config src-tauri/tauri.release.conf.json
+
+      - name: Verify signature and notarization
+        run: |
+          APP="target/$TARGET/release/bundle/macos/$PRODUCT_NAME.app"
+          codesign --verify --deep --strict "$APP"
+          spctl --assess --type execute -vv "$APP"
+          xcrun stapler validate "$APP"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BUNDLE="target/$TARGET/release/bundle"
+          ARCHIVE="$(ls "$BUNDLE"/macos/*.app.tar.gz)"
+          DMG="$(ls "$BUNDLE"/dmg/*.dmg)"
+          NAME="${PRODUCT_NAME// /_}"
+          cp "$ARCHIVE" "$RUNNER_TEMP/${NAME}_aarch64.app.tar.gz"
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${NAME}_aarch64.app.tar.gz"
+          bash desktop/scripts/generate-oss-latest-json.sh "$VERSION" "darwin-aarch64:$ARCHIVE.sig:$URL" > "$RUNNER_TEMP/latest.json"
+          gh release create "$GITHUB_REF_NAME" --title "$PRODUCT_NAME $VERSION" --generate-notes \
+            "$DMG" "$RUNNER_TEMP/${NAME}_aarch64.app.tar.gz" "$RUNNER_TEMP/latest.json"
