@@ -1,3 +1,12 @@
+# A relay restart or upgrade makes requests and socket reconnects wait for the
+# new container instead of failing with 502.
+(relay) {
+	reverse_proxy relay:3000 {
+		lb_try_duration 30s
+		lb_try_interval 250ms
+	}
+}
+
 {$BUZZ_DOMAIN} {
 	encode zstd gzip
 
@@ -33,12 +42,12 @@
 		header Upgrade websocket
 	}
 	handle @relay_socket {
-		reverse_proxy relay:3000
+		import relay
 	}
 
 	@nip11 header Accept *application/nostr+json*
 	handle @nip11 {
-		reverse_proxy relay:3000
+		import relay
 	}
 
 	@web_asset {
@@ -72,6 +81,6 @@
 	}
 
 	handle {
-		reverse_proxy relay:3000
+		import relay
 	}
 }

@@ -1,5 +1,5 @@
 // Background notifications for the browser build. The relay keeps a push
-// lease (NIP-PL, kind 30350) for this browser and, when a mention, DM or
+// lease (buzz-push-v1, kind 30350) for this browser and, when a mention, DM or
 // reply to the user arrives, wakes it through our Web Push gateway
 // (deploy/compose/webpush). The service worker then fetches the message and
 // shows it, so no content transits Apple or Google.
@@ -29,7 +29,8 @@ const MAX_SUBSCRIPTIONS = 16;
 type Descriptor = {
   origin: string;
   keys: Array<{ id: string; pubkey: string; current?: boolean }>;
-  app_profiles: Array<{ id: string; transport: string }>;
+  // Transport -> lease classes; our gateway stands in for the APNs one.
+  class_support: Record<string, string[]>;
   push_kinds: number[];
 };
 type LeaseState = {
@@ -62,7 +63,10 @@ async function fetchDescriptor(): Promise<Descriptor | null> {
   const response = await fetch(relayHttpUrl(), {
     headers: { Accept: "application/nostr+json" },
   });
-  return response.ok ? ((await response.json()).push ?? null) : null;
+  if (!response.ok) return null;
+  // Older relays speak nip-pl, whose leases name an app profile.
+  const info = await response.json();
+  return info.supported_extensions?.includes("buzz-push-v1") ? info.push : null;
 }
 
 // Mentions (which also reach DMs and replies, since those p-tag the people
@@ -196,7 +200,12 @@ export async function syncPushLease(enabled: boolean): Promise<void> {
       ]),
     ),
   });
-  const fingerprint = JSON.stringify([subscription.endpoint, subscriptions]);
+  const [transport] = Object.keys(push.class_support);
+  const fingerprint = JSON.stringify([
+    transport,
+    subscription.endpoint,
+    subscriptions,
+  ]);
   if (
     state?.active &&
     state.fingerprint === fingerprint &&
@@ -207,10 +216,8 @@ export async function syncPushLease(enabled: boolean): Promise<void> {
     "/webpush/register",
     { subscription: subscription.toJSON(), generation },
   );
-  const [profile] = push.app_profiles;
   await publishLease(key, push, installation, {
-    app_profile: profile.id,
-    transport: profile.transport,
+    transport,
     endpoint: endpoint_grant,
     generation,
     active: true,
