@@ -170,24 +170,32 @@ export function createGateway({
     // old; the service worker then skips what they have read meanwhile.
     if (await isOnline(record.pubkey).catch(() => false))
       return [503, { status: "retry", retry_after_seconds: DEFER_SECONDS }];
+    const host = new URL(record.endpoint).hostname;
     try {
       // One collapsible topic: a phone back online gets one wake, not a burst.
+      // Apple refuses it (400 BadWebPushTopic), so its wakes go uncollapsed.
+      const topic = host.endsWith("push.apple.com") ? {} : { topic: "buzz-wake" };
       await send(
         { endpoint: record.endpoint, keys: record.keys },
         JSON.stringify({ v: 1 }),
-        { TTL: ttl, urgency: "high", topic: "buzz-wake", timeout: 5000 },
+        { TTL: ttl, urgency: "high", ...topic, timeout: 5000 },
       );
       return [200, { status: "accepted" }];
     } catch (error) {
       const status = error?.statusCode ?? 0;
-      if ([400, 404, 410, 413].includes(status)) {
-        const host = new URL(record.endpoint).hostname;
-        console.warn(`push service ${status} on ${host}: ${error?.body}`);
+      console.warn(`push service ${status || "error"} on ${host}: ${error?.body ?? error?.message}`);
+      // Only a gone subscription, or a token Apple no longer knows, ends the lease.
+      if (
+        status === 404 ||
+        status === 410 ||
+        (status === 400 && /BadWebPushToken|BadDeviceToken/.test(error?.body))
+      ) {
         delete grants[grant];
         await save();
         return invalid(grant);
       }
-      console.warn(`push service ${status || "error"}: ${error?.message}`);
+      // Any other refusal is about this request: drop the wake, keep the lease.
+      if (status === 400 || status === 413) return [502, { error: "push request refused" }];
       const retryAfter = Number(error?.headers?.["retry-after"]);
       return [
         503,

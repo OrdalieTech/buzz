@@ -63,10 +63,10 @@ async function start(send, isOnline) {
     });
     return [response.status, await response.json()];
   };
-  const register = (generation = 7) =>
+  const register = (generation = 7, endpoint = subscription.endpoint) =>
     post(
       "/webpush/register",
-      { subscription, generation },
+      { subscription: { ...subscription, endpoint }, generation },
       userKey,
       `${ORIGIN}/webpush/register`,
     );
@@ -152,6 +152,27 @@ test("a gone subscription tells the relay to disable that lease generation", asy
   const [againStatus, again] = await gw.deliver(endpoint_grant);
   assert.equal(againStatus, 410);
   assert.equal(again.generation, 9);
+  gw.close();
+});
+
+test("Apple gets no topic, which it refuses as BadWebPushTopic", async () => {
+  const gw = await start();
+  const [, { endpoint_grant }] = await gw.register(7, "https://web.push.apple.com/QGt0");
+  assert.equal((await gw.deliver(endpoint_grant))[0], 200);
+  assert.equal(gw.sent[0][2].topic, undefined);
+  gw.close();
+});
+
+test("a refused request drops the wake but keeps the lease", async () => {
+  const gw = await start(() => {
+    throw Object.assign(new Error("bad"), {
+      statusCode: 400,
+      body: '{"reason":"BadWebPushTopic"}',
+    });
+  });
+  const [, { endpoint_grant }] = await gw.register();
+  assert.equal((await gw.deliver(endpoint_grant))[0], 502);
+  assert.ok(gw.gateway.grants()[endpoint_grant]);
   gw.close();
 });
 
