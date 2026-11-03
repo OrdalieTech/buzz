@@ -124,7 +124,8 @@ export function createGateway({
     const mine = Object.entries(grants)
       .filter(([, record]) => record.pubkey === pubkey)
       .sort(([, a], [, b]) => a.created_at - b.created_at);
-    for (const [grant] of mine.slice(0, mine.length - MAX_PER_PUBKEY + 1))
+    const excess = Math.max(0, mine.length - MAX_PER_PUBKEY + 1);
+    for (const [grant] of mine.slice(0, excess))
       delete grants[grant];
     if (Object.keys(grants).length >= MAX_GRANTS)
       return [503, { error: "gateway full" }];
@@ -180,6 +181,8 @@ export function createGateway({
     } catch (error) {
       const status = error?.statusCode ?? 0;
       if ([400, 404, 410, 413].includes(status)) {
+        const host = new URL(record.endpoint).hostname;
+        console.warn(`push service ${status} on ${host}: ${error?.body}`);
         delete grants[grant];
         await save();
         return invalid(grant);
@@ -224,7 +227,11 @@ export function createGateway({
     }
     if (pathname === "/webpush/register" || pathname === "/webpush/unregister") {
       const pubkey = authenticate(auth, `${publicOrigin}${pathname}`, body);
-      if (!pubkey) return [401, { error: "unauthorized" }];
+      if (!pubkey) {
+        console.warn(`${pathname}: NIP-98 rejected`);
+        return [401, { error: "unauthorized" }];
+      }
+      console.log(`${pathname} ${pubkey.slice(0, 8)}`);
       return pathname === "/webpush/register"
         ? register(pubkey, json)
         : unregister(pubkey, json);
