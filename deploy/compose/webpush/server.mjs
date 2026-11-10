@@ -20,9 +20,11 @@ const MAX_BODY = 16 * 1024;
 const MAX_PER_PUBKEY = 10;
 const MAX_GRANTS = 10_000;
 const MAX_WAKE_TTL = 3600;
-// First retry delay asked of the relay while the user is online; its backoff
-// doubles it per attempt (15 s, 45 s, 1.75 min, … 32 min after the message).
-const DEFER_SECONDS = 15;
+// While the user is online on another device, a wake waits this long once
+// for them to read it there (the relay retries after it), then goes out
+// anyway: "online" does not mean they are looking, and the service worker
+// skips what they read meanwhile.
+const HOLD_SECONDS = 120;
 const AUTH_WINDOW_SECONDS = 60;
 // Browser push services (Chrome, Chromium builds, Safari, Firefox, Edge).
 const PUSH_HOSTS = [
@@ -49,6 +51,8 @@ export function createGateway({
   let saving = Promise.resolve();
   const seenAuth = new Map();
   const deliveries = new Map();
+  // Wakes held for presence (request_id is the relay's wake id), and when.
+  const held = new Map();
 
   const load = async () => {
     try {
@@ -165,11 +169,15 @@ export function createGateway({
     const ttl = Math.min(MAX_WAKE_TTL, Number(expires_at) - now());
     if (!(ttl > 0)) return [200, { status: "accepted" }];
     // Someone active on another device (Buzz desktop, or the app open on this
-    // phone) sees the message there. The relay retries with backoff, so the
-    // wake lands once they go away, or is dropped when the message is an hour
-    // old; the service worker then skips what they have read meanwhile.
-    if (await isOnline(record.pubkey).catch(() => false))
-      return [503, { status: "retry", retry_after_seconds: DEFER_SECONDS }];
+    // phone) may see the message there first.
+    if (
+      !held.has(request_id) &&
+      (await isOnline(record.pubkey).catch(() => false))
+    ) {
+      for (const [id, at] of held) if (at < now() - MAX_WAKE_TTL) held.delete(id);
+      held.set(request_id, now());
+      return [503, { status: "retry", retry_after_seconds: HOLD_SECONDS }];
+    }
     const host = new URL(record.endpoint).hostname;
     try {
       // One collapsible topic: a phone back online gets one wake, not a burst.

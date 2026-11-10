@@ -191,17 +191,15 @@ test("a throttled push service asks the relay to retry", async () => {
   gw.close();
 });
 
-test("a user online elsewhere gets no wake until they go away", async () => {
-  let online = true;
-  const gw = await start(undefined, async () => online);
+test("a user online elsewhere gets the wake after one hold", async () => {
+  const gw = await start(undefined, async () => true);
   const [, { endpoint_grant }] = await gw.register();
   const id = crypto.randomUUID();
   assert.deepEqual(await gw.deliver(endpoint_grant, id), [
     503,
-    { status: "retry", retry_after_seconds: 15 },
+    { status: "retry", retry_after_seconds: 120 },
   ]);
   assert.equal(gw.sent.length, 0);
-  online = false;
   assert.deepEqual(await gw.deliver(endpoint_grant, id), [200, { status: "accepted" }]);
   assert.equal(gw.sent.length, 1);
   gw.close();
