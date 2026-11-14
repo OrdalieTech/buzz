@@ -57,17 +57,19 @@ class _CommunityMenuSheet extends StatelessWidget {
                     ),
                 ],
               ),
-            AppListCard(
-              children: [
-                AppListRow(
-                  key: const Key('community-menu-switch'),
-                  icon: BuzzIcons.arrowLeftRight,
-                  title: 'Switch Community',
-                  trailing: const Icon(BuzzIcons.chevronRight, size: 18),
-                  onTap: openSwitcher,
-                ),
-              ],
-            ),
+            // An internal build reaches only its organization's community.
+            if (!OrganizationEnvironment.enabled)
+              AppListCard(
+                children: [
+                  AppListRow(
+                    key: const Key('community-menu-switch'),
+                    icon: BuzzIcons.arrowLeftRight,
+                    title: 'Switch Community',
+                    trailing: const Icon(BuzzIcons.chevronRight, size: 18),
+                    onTap: openSwitcher,
+                  ),
+                ],
+              ),
           ],
         ),
       ),
@@ -99,8 +101,9 @@ Future<void> _confirmRemoveCommunity(
       Navigator.of(context).pop();
     }
   } catch (e) {
-    messenger.showSnackBar(
+    messenger.showFeedbackSnackBar(
       SnackBar(content: Text('Failed to remove community: $e')),
+      kind: ToastKind.error,
     );
   }
 }
@@ -131,40 +134,21 @@ class _CommunityIndicator extends ConsumerWidget {
         label: 'Community settings',
         child: Opacity(
           opacity: hidden ? 0 : 1,
-          child: CommunityAvatar(
-            key: avatarKey,
-            name: activeCommunity?.name,
-            relayUrl: activeCommunity?.relayUrl,
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _CommunityHeaderTitle extends ConsumerWidget {
-  final TextStyle? style;
-  final VoidCallback onTap;
-
-  const _CommunityHeaderTitle({required this.onTap, this.style});
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final name = ref.watch(activeCommunityProvider).value?.name;
-    final title = name?.trim();
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: onTap,
-      child: SizedBox.expand(
-        child: Align(
-          alignment: Alignment.centerLeft,
-          child: Padding(
-            padding: const EdgeInsets.only(left: Grid.xxs),
-            child: Text(
-              title == null || title.isEmpty ? 'Community' : title,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: style,
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(Radii.full),
+            child: ColoredBox(
+              color: context.controlSurface,
+              child: SizedBox.square(
+                dimension: Grid.xl,
+                child: Center(
+                  child: CommunityAvatar(
+                    key: avatarKey,
+                    size: _kTopSectionProfileAvatarSize,
+                    name: activeCommunity?.name,
+                    relayUrl: activeCommunity?.relayUrl,
+                  ),
+                ),
+              ),
             ),
           ),
         ),

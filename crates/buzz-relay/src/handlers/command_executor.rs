@@ -27,7 +27,10 @@ use buzz_workflow::executor::TriggerContext;
 use crate::state::AppState;
 use crate::webhook_secret;
 
-use super::ingest::{extract_channel_id, IngestAuth, IngestError, IngestResult};
+use super::ingest::{
+    agent_dm_allowed, agent_owner_cached, extract_channel_id, IngestAuth, IngestError,
+    IngestResult, AGENT_DM_REFUSED,
+};
 use super::side_effects::{
     emit_group_discovery_events, emit_membership_notification, emit_system_message,
     publish_dm_visibility_snapshot,
@@ -153,7 +156,7 @@ async fn persist_command_event(
             )
             .await
             .map_err(|e| {
-                IngestError::Internal(format!("error: replace parameterized event: {e}"))
+                IngestError::Internal(format!("error: replace parameterized event: {}", e.kind()))
             })?;
 
         return match result.status {
@@ -184,7 +187,7 @@ async fn persist_command_event(
 
     let (_, was_inserted) = buzz_db::event::insert_event_in_transaction(&mut tx, event, channel_id)
         .await
-        .map_err(|e| IngestError::Internal(format!("error: insert event: {e}")))?;
+        .map_err(|e| IngestError::Internal(format!("error: insert event: {}", e.kind())))?;
     if was_inserted {
         Ok(PersistResult::Inserted(tx))
     } else {
@@ -291,6 +294,25 @@ fn compute_definition_hash(json_str: &str) -> Vec<u8> {
     Sha256::digest(json_str.as_bytes()).to_vec()
 }
 
+/// An agent may only open or widen a DM into one whose participants are
+/// exactly itself and its owner. Humans pass untouched.
+async fn check_agent_dm_participants(
+    tenant: &TenantContext,
+    state: &AppState,
+    self_bytes: &[u8],
+    participants: &[Vec<u8>],
+) -> Result<(), IngestError> {
+    let owner = agent_owner_cached(state, tenant.community(), self_bytes)
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: agent owner lookup: {e}")))?;
+    match owner {
+        Some(owner) if !agent_dm_allowed(self_bytes, &owner, participants) => {
+            Err(IngestError::Rejected(AGENT_DM_REFUSED.into()))
+        }
+        _ => Ok(()),
+    }
+}
+
 async fn handle_dm_open(
     tenant: &TenantContext,
     state: &Arc<AppState>,
@@ -328,6 +350,8 @@ async fn handle_dm_open(
             all_bytes.push(ob.clone());
         }
     }
+
+    check_agent_dm_participants(tenant, state, &self_bytes, &all_bytes).await?;
 
     // Persist the command event (idempotency) — returns open transaction
     let tx = match persist_command_event(&state.db, tenant, event, None).await? {
@@ -490,6 +514,7 @@ async fn handle_dm_add_member(
             "invalid: DM supports at most 9 participants".into(),
         ));
     }
+    check_agent_dm_participants(tenant, state, &self_bytes, &all_bytes).await?;
 
     // Persist the command event — returns open transaction
     let tx = match persist_command_event(&state.db, tenant, event, None).await? {
@@ -664,6 +689,21 @@ async fn handle_workflow_def(
             "forbidden: not a member of this channel".into(),
         ));
     }
+    // A workflow acts as its owner in this channel, so saving one is a write:
+    // a guest may not. Every run-creation door rechecks the same rule
+    // (`check_owner_authority`), so a later demotion also stops the runs.
+    let may_write = state
+        .db
+        .get_member_role(tenant.community(), channel_id, &self_bytes)
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: role check: {e}")))?
+        .and_then(|r| r.parse::<buzz_db::channel::MemberRole>().ok())
+        .is_some_and(|r| r.can_post());
+    if !may_write {
+        return Err(IngestError::Rejected(
+            "restricted: only members can post in this channel".into(),
+        ));
+    }
 
     // 3. Parse YAML from event.content
     let (def, definition_json_str) = buzz_workflow::WorkflowEngine::parse_yaml(&event.content)
@@ -682,7 +722,7 @@ async fn handle_workflow_def(
             .map_err(|e| IngestError::Internal(format!("error: role check: {e}")))?;
         if !matches!(role.as_deref(), Some("owner") | Some("admin")) {
             return Err(IngestError::Rejected(
-                "forbidden: workflows with call_webhook actions require the owner or admin role"
+                "forbidden: workflows with call_webhook actions require the channel owner or admin role"
                     .into(),
             ));
         }
@@ -809,6 +849,9 @@ async fn handle_workflow_def(
     })
 }
 
+/// Trigger rejection for a missing workflow and for one the sender does not own.
+const WORKFLOW_NOT_FOUND: &str = "invalid: workflow not found or not triggerable by you";
+
 async fn handle_workflow_trigger(
     tenant: &TenantContext,
     state: &Arc<AppState>,
@@ -835,15 +878,15 @@ async fn handle_workflow_trigger(
         .db
         .get_workflow(community_id, workflow_id)
         .await
-        .map_err(|_| IngestError::Rejected("invalid: workflow not found".into()))?;
+        .map_err(|_| IngestError::Rejected(WORKFLOW_NOT_FOUND.into()))?;
 
     // 3. Manual triggers execute with the workflow owner's authority, so only
     // the owner may start them. Channel membership alone is insufficient: a
     // member could otherwise invoke another user's webhook or message actions.
+    // Anyone else is told the workflow is not found, so the response never
+    // reveals whether a workflow ID exists.
     if workflow.owner_pubkey != self_bytes {
-        return Err(IngestError::Rejected(
-            "forbidden: not authorized to trigger this workflow".into(),
-        ));
+        return Err(IngestError::Rejected(WORKFLOW_NOT_FOUND.into()));
     }
 
     // SEC-006: manual triggers must honor the workflow's lifecycle state and
@@ -915,6 +958,7 @@ async fn handle_workflow_trigger(
             workflow_id,
             Some(&event_id_bytes),
             trigger_ctx_json.as_ref(),
+            &buzz_db::workflow::RunCause::Manual(self_bytes.clone()),
         )
         .await
         .map_err(|e| IngestError::Internal(format!("error: db create_workflow_run: {e}")))?;
@@ -954,14 +998,12 @@ async fn handle_workflow_trigger(
             }
         };
 
-        let result = buzz_workflow::executor::execute_from_step(
+        let result = buzz_workflow::executor::execute_run(
             &engine,
             community_id,
             run_id,
             &def,
             &trigger_ctx_clone,
-            0,
-            None,
         )
         .await;
         engine
@@ -1267,7 +1309,7 @@ async fn handle_approval_deny(
 }
 
 /// Resume a suspended workflow run after an approval gate has been granted.
-async fn resume_workflow_after_approval(
+pub(crate) async fn resume_workflow_after_approval(
     engine: Arc<buzz_workflow::WorkflowEngine>,
     db: buzz_db::Db,
     community_id: CommunityId,
@@ -1424,6 +1466,7 @@ mod postgres_tests {
             }
             Err(IngestError::AuthFailed(message)) => panic!("unexpected auth failure: {message}"),
             Err(IngestError::Internal(message)) => panic!("unexpected internal failure: {message}"),
+            Err(error @ IngestError::Ban { .. }) => panic!("unexpected ban refusal: {error:?}"),
             Ok(_) => panic!("expected revision parsing to fail"),
         }
     }

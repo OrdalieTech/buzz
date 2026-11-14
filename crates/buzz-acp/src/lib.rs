@@ -96,8 +96,8 @@ fn current_working_directory() -> Result<String> {
 
 /// Publish a kind:20001 presence update event via the WebSocket connection.
 ///
-/// Ephemeral kinds (20000-29999) are rejected by the HTTP bridge, so presence
-/// updates must be routed through the WS path.
+/// The HTTP bridge rejects presence (kind:20001); typing (kind:20002) is the
+/// only ephemeral kind it accepts. Presence updates must use the WS path.
 ///
 /// Content is a bare status string (`"online"`, `"away"`, `"offline"`) matching
 /// the desktop client's format. The relay stores this in Redis and synthesizes
@@ -1221,8 +1221,7 @@ impl ObserverPublishQueue {
         // Pre-trim at enqueue so (a) byte accounting reflects what will ship
         // and (b) one oversized leaf cannot force every frame it touches into
         // whole-envelope elision downstream.
-        fit_observer_event_to_budget(&mut event);
-        let bytes = serialized_len(&event);
+        let bytes = fit_observer_event_to_budget(&mut event);
         self.pending_bytes += bytes;
         self.events.push_back((bytes, source_events, event));
     }
@@ -1638,44 +1637,55 @@ const OBSERVER_LEAF_RETAIN_BYTES: usize = 3_000;
 /// byte-identical.
 ///
 /// The cap is measured in SERIALIZED bytes (JSON escaping makes serialized
-/// length differ from raw), so the stop condition is always a full reserialize
-/// of the whole frame: that counts the envelope, the variable `Option<String>`
-/// IDs, and any elision markers exactly. No separate margin constant is needed.
+/// length differ from raw). For small leaves, subtract the old serialized
+/// size and add the replacement's size. JSON delimiters and the envelope stay
+/// unchanged, so this accounting is exact. For a dominant leaf, recount the
+/// fitted frame instead of traversing the large original leaf again.
 ///
 /// Termination is provable: each iteration elides the largest string leaf that
-/// would STRICTLY shrink the serialized frame, then reserializes. Shrinkability
-/// is re-evaluated against each leaf's CURRENT value, so a leaf already at its
-/// retained floor can never be re-elided — the loop strictly decreases the
-/// serialized length each pass and is bounded by the leaf count. When no leaf
-/// can shrink the frame and it still overflows, the payload is replaced with a
-/// tiny stub, which trivially fits. Monotone decrease, bounded below by the stub.
+/// would STRICTLY shrink the serialized frame, then updates its size.
+/// Shrinkability is re-evaluated against each leaf's CURRENT value: a shorter
+/// removed-byte count can shorten an existing marker once more. Every pass
+/// strictly decreases serialized length, so the loop terminates. When no leaf
+/// can shrink the frame and it still overflows, replace the payload with a
+/// small stub. Callers must still reject an oversized metadata envelope.
 ///
-/// **Signature choice (`&mut`, double-serialize accepted):** on the common
-/// under-budget path this serializes the frame once to decide it fits, then
-/// `encrypt_observer_payload` serializes it again — one extra `to_string` of an
-/// already-small frame. Reusing that string would mean changing buzz-core's
-/// `encrypt_observer_payload` signature or adding a parallel encrypt path; both
-/// are out of this change's scope (buzz-core stays untouched). The clean `&mut`
-/// signature with one cheap redundant serialize is the deliberate tradeoff.
-fn fit_observer_event_to_budget(event: &mut observer::ObserverEvent) {
-    if serialized_len(event) <= OBSERVER_MAX_PLAINTEXT_LEN {
-        return;
+/// Returns the fitted serialized size so retention can account for bytes
+/// without another traversal. Counting writes avoid allocating a second copy
+/// of a potentially multi-megabyte source frame just to measure its size.
+fn fit_observer_event_to_budget(event: &mut observer::ObserverEvent) -> usize {
+    let mut bytes = serialized_len(event);
+    if bytes <= OBSERVER_MAX_PLAINTEXT_LEN {
+        return bytes;
     }
 
-    // Raw size of the payload we are about to trim, captured before mutation so
-    // the stub's `originalBytes` reports source bytes discarded, not serialized
-    // overflow — consistent with the per-leaf marker's raw byte count.
-    let original_payload_bytes = serde_json::to_string(&event.payload)
-        .map(|s| s.len())
-        .unwrap_or(0);
+    // Derive the original payload size from the measured frame and its small
+    // envelope, avoiding a second traversal of the oversized source payload.
+    // JSON null occupies four bytes in the temporary envelope.
+    let payload = event.payload.take();
+    let envelope_bytes = serialized_len(event).saturating_sub(4);
+    event.payload = payload;
+    let original_payload_bytes = bytes.saturating_sub(envelope_bytes);
 
-    // Elide the largest shrinkable leaf, reserialize, repeat. Each successful
-    // elision strictly shrinks the serialized frame, and a floored leaf can
-    // never be re-elided, so the loop is bounded by the leaf count.
+    // Each successful elision strictly shrinks the serialized frame, so the
+    // loop terminates even when a shortened marker permits another elision.
     while let Some(leaf) = largest_shrinkable_leaf(&mut event.payload) {
-        elide_leaf(leaf);
-        if serialized_len(event) <= OBSERVER_MAX_PLAINTEXT_LEN {
-            return;
+        // A JSON string uses at most six bytes per source byte (\u0000),
+        // plus quotes. Use deltas only when even that upper bound is small
+        // relative to the frame; otherwise recount the now-smaller frame.
+        let leaf_bound = leaf
+            .as_str()
+            .map_or(0, |s| s.len().saturating_mul(6).saturating_add(2));
+        if leaf_bound < bytes / 2 {
+            let old_leaf_bytes = serialized_len(leaf);
+            elide_leaf(leaf);
+            bytes = bytes - old_leaf_bytes + serialized_len(leaf);
+        } else {
+            elide_leaf(leaf);
+            bytes = serialized_len(event);
+        }
+        if bytes <= OBSERVER_MAX_PLAINTEXT_LEN {
+            return bytes;
         }
     }
 
@@ -1685,10 +1695,27 @@ fn fit_observer_event_to_budget(event: &mut observer::ObserverEvent) {
         "elided": format!("{} payload too large", event.kind),
         "originalBytes": original_payload_bytes,
     });
+    serialized_len(event)
 }
 
-fn serialized_len(event: &observer::ObserverEvent) -> usize {
-    serde_json::to_string(event).map(|s| s.len()).unwrap_or(0)
+fn serialized_len(value: &impl serde::Serialize) -> usize {
+    let mut counter = ObserverByteCounter(0);
+    serde_json::to_writer(&mut counter, value)
+        .map(|()| counter.0)
+        .unwrap_or(usize::MAX)
+}
+
+struct ObserverByteCounter(usize);
+
+impl std::io::Write for ObserverByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Find the longest string leaf that would STRICTLY shrink if elided, returning
@@ -3998,6 +4025,7 @@ async fn run_harness(
                     &mut respawn_tasks,
                     observer.clone(),
                     Some(&ctx.rest_client),
+                    &mut last_activity,
                 ) == LoopAction::Exit
                 {
                     break;
@@ -5239,7 +5267,14 @@ fn handle_prompt_result(
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
     rest_client: Option<&relay::RestClient>,
+    last_activity: &mut tokio::time::Instant,
 ) -> LoopAction {
+    // Start a full idle interval when channel work settles, before releasing
+    // its in-flight guard. Heartbeats must not keep an otherwise idle pool alive.
+    match &result.source {
+        PromptSource::Channel(_) => *last_activity = tokio::time::Instant::now(),
+        PromptSource::Heartbeat => {}
+    }
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
     let successful_steer_deliveries = pool
@@ -6456,6 +6491,10 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
         args: vec![],
         env: {
             let mut env = vec![
+                EnvVar {
+                    name: "BUZZ_OUTPUT_FORMAT".into(),
+                    value: config::agent_output_format(&config.persona_env_vars),
+                },
                 EnvVar {
                     name: "BUZZ_RELAY_URL".into(),
                     value: config.relay_url.clone(),
@@ -10365,6 +10404,46 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
+    fn session_new_mcp_server_uses_effective_output_format() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let inherited = std::env::var_os("BUZZ_OUTPUT_FORMAT");
+        for (operator, persona, expected) in [
+            (None, vec![], "agent"),
+            (None, vec!["json"], "json"),
+            (None, vec!["json", "compact"], "compact"),
+            (Some("compact"), vec![], "compact"),
+            (Some("json"), vec!["compact"], "json"),
+            (Some(""), vec!["json"], ""),
+        ] {
+            match operator {
+                Some(value) => std::env::set_var("BUZZ_OUTPUT_FORMAT", value),
+                None => std::env::remove_var("BUZZ_OUTPUT_FORMAT"),
+            }
+            let mut config = test_config();
+            config.persona_env_vars = persona
+                .iter()
+                .map(|value| ("BUZZ_OUTPUT_FORMAT".into(), (*value).into()))
+                .collect();
+            let servers = build_mcp_servers(&config);
+            match &inherited {
+                Some(value) => std::env::set_var("BUZZ_OUTPUT_FORMAT", value),
+                None => std::env::remove_var("BUZZ_OUTPUT_FORMAT"),
+            }
+            let formats: Vec<_> = servers[0]
+                .env
+                .iter()
+                .filter(|entry| entry.name == "BUZZ_OUTPUT_FORMAT")
+                .map(|entry| entry.value.as_str())
+                .collect();
+            assert_eq!(
+                formats,
+                vec![expected],
+                "operator={operator:?}, persona={persona:?}"
+            );
+        }
+    }
+
+    #[test]
     fn session_new_mcp_server_forwards_buzz_auth_tag() {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BUZZ_AUTH_TAG", "test-attestation-tag");
@@ -11286,6 +11365,114 @@ mod error_outcome_emission_tests {
         agent.state.set_scope_owner_generation(scope, generation);
     }
 
+    // Exercise result handling and both production idle decisions with a fake clock.
+    // No relay or provider is used; cat supplies only an owned process handle.
+    async fn assert_completion_idle_window(channel_turn: bool) {
+        let channel_id = Uuid::new_v4();
+        let scope = scope::SessionScope::Conversation { channel_id };
+        let mut agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        if channel_turn {
+            bind_agent_scope_owner(&mut pool, &mut agent, scope.clone());
+        }
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: channel_turn.then_some(channel_id),
+                scope: channel_turn.then_some(scope.clone()),
+                turn_id: "idle-window".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = !channel_turn;
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let bound = Duration::from_secs(30);
+        let mut last_activity = tokio::time::Instant::now();
+        tokio::time::advance(bound * 2).await;
+        let completed_at = tokio::time::Instant::now();
+        let result = PromptResult {
+            agent,
+            source: if channel_turn {
+                PromptSource::Channel(scope)
+            } else {
+                PromptSource::Heartbeat
+            },
+            turn_id: "idle-window".into(),
+            outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
+            batch: None,
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &HashSet::new(),
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+            &mut last_activity,
+        );
+        // Match the main loop: consume finished prompt tasks before the idle check.
+        while pool.join_set.join_next().await.is_some() {}
+        assert!(pool.task_map().is_empty());
+        assert!(!heartbeat_in_flight);
+        assert!(!queue.has_undispatched_work());
+        let sleep_due = |now| {
+            idle_pool_sleep_due(
+                true,
+                last_activity,
+                now,
+                bound,
+                heartbeat_in_flight,
+                !pool.join_set.is_empty(),
+                queue.has_undispatched_work(),
+                any_respawn_in_flight(&crash_history),
+            )
+        };
+        assert_eq!(sleep_due(completed_at), !channel_turn);
+        assert_eq!(
+            inactivity_expired(last_activity, completed_at, bound, false),
+            !channel_turn
+        );
+        if channel_turn {
+            assert_eq!(last_activity, completed_at);
+            assert!(!sleep_due(completed_at + bound - Duration::from_millis(1)));
+        }
+        assert!(sleep_due(completed_at + bound));
+        assert!(inactivity_expired(
+            last_activity,
+            completed_at + bound,
+            bound,
+            false
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_channel_turn_gets_a_full_bounded_idle_window() {
+        assert_completion_idle_window(true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_heartbeat_does_not_extend_the_idle_window() {
+        assert_completion_idle_window(false).await;
+    }
+
     #[tokio::test]
     async fn successful_native_steer_is_transferred_to_live_session_delivery_state() {
         let channel_id = Uuid::new_v4();
@@ -11357,6 +11544,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             None,
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         let returned = pool.agents_mut()[0].as_ref().expect("returned agent");
@@ -11437,6 +11625,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             None,
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         let returned = pool.agents_mut()[0].as_ref().expect("returned agent");
@@ -11558,6 +11747,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             None,
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         let returned = pool.agents_mut()[0].as_ref().expect("returned agent");
@@ -11627,6 +11817,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         let turn_errors: Vec<_> = observer
@@ -11896,6 +12087,7 @@ mod error_outcome_emission_tests {
                 &mut respawn_tasks,
                 Some(observer.clone()),
                 None,
+                &mut tokio::time::Instant::now(),
             );
             let events = observer.snapshot();
             let turn_error = events.iter().find(|e| e.kind == "turn_error").unwrap();
@@ -11991,6 +12183,7 @@ mod error_outcome_emission_tests {
                 &mut respawn_tasks,
                 None,
                 None,
+                &mut tokio::time::Instant::now(),
             );
             (
                 queue.pending_channels(),
@@ -12100,6 +12293,7 @@ mod error_outcome_emission_tests {
                 &mut respawn_tasks,
                 None,
                 None,
+                &mut tokio::time::Instant::now(),
             );
             (
                 queue.pending_channels(),
@@ -12195,6 +12389,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         let events = observer.snapshot();
@@ -12292,6 +12487,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         let events = observer.snapshot();
@@ -12413,6 +12609,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         // Batch preserved as a cancelled merge, not dead-lettered — same
@@ -12549,6 +12746,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         // No batch to merge — the queue has nothing pending for any channel.
@@ -12680,6 +12878,7 @@ mod error_outcome_emission_tests {
                 &mut respawn_tasks,
                 None,
                 None,
+                &mut tokio::time::Instant::now(),
             ),
             LoopAction::Continue
         ));
@@ -12832,6 +13031,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             None,
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         // The batch must not be requeued: pending_channels returns 0.
@@ -12940,6 +13140,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             Some(&rest),
+            &mut tokio::time::Instant::now(),
         );
 
         // The batch must not be requeued: pending_channels returns 0.
@@ -13211,6 +13412,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             None,
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         // Non-auth application error: batch IS requeued (first attempt, retry budget > 0).
@@ -13391,6 +13593,38 @@ mod observer_payload_trim_tests {
             20_000,
             "the smaller leaf is left untouched once the frame fits"
         );
+
+        // Many escaped leaves exercise incremental size accounting; enough
+        // shrink to fit while untouched leaves and section order survive.
+        for text in ["x", "\n\"\\", "🐝\u{0}"] {
+            let leaf = format!(
+                "{}{}{}",
+                "x".repeat(3_000),
+                text.repeat(4_000),
+                "y".repeat(3_000)
+            );
+            let mut event = event_with_payload(
+                "acp_read",
+                serde_json::json!({"items": vec![leaf.clone(); 9], "small": "keep"}),
+            );
+            let fitted_bytes = fit_observer_event_to_budget(&mut event);
+            assert_eq!(fitted_bytes, serialized(&event).len());
+            assert!(fitted_bytes <= OBSERVER_MAX_PLAINTEXT_LEN);
+            let items = event.payload["items"]
+                .as_array()
+                .expect("trimmed sections survive");
+            assert_eq!(items.len(), 9);
+            assert_eq!(event.payload["small"], "keep");
+            let mut saw_untouched = false;
+            for item in items {
+                if item == &leaf {
+                    saw_untouched = true;
+                } else {
+                    assert!(!saw_untouched, "equal-size leaves elide in traversal order");
+                    assert!(item.as_str().unwrap().contains("…[elided"));
+                }
+            }
+        }
     }
 
     #[test]
@@ -13442,6 +13676,19 @@ mod observer_payload_trim_tests {
             "fell back to the stub"
         );
         assert!(event.payload.get("originalBytes").is_some());
+
+        // An escaped leaf just above its retained floor is small relative to
+        // a non-shrinkable numeric array. Delta accounting must include the
+        // replacement, or it would incorrectly accept this oversized frame.
+        let mut event = event_with_payload(
+            "acp_read",
+            serde_json::json!({"numbers": vec![0; 18_500], "edge": "\u{0}".repeat(6_100)}),
+        );
+        let original_payload_bytes = serialized_len(&event.payload);
+        let fitted_bytes = fit_observer_event_to_budget(&mut event);
+        assert_eq!(fitted_bytes, serialized(&event).len());
+        assert!(fitted_bytes <= OBSERVER_MAX_PLAINTEXT_LEN);
+        assert_eq!(event.payload["originalBytes"], original_payload_bytes);
     }
 
     #[test]

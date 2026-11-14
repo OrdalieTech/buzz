@@ -279,7 +279,8 @@ void main() {
 
       expect(find.bySemanticsLabel('Checking age eligibility'), findsNothing);
       expect(find.byType(HomePage), findsOneWidget);
-      expect(find.byType(Navigator), findsOneWidget);
+      // Home may also host a nested conversation navigator.
+      expect(find.byType(MaterialApp), findsOneWidget);
       expect(relaySession.builds, 1);
       expect(requests, ageGatingEnabled ? 1 : 0);
       await tester.pump();
@@ -513,7 +514,12 @@ class _RecordingPairAuthNotifier extends _UnauthenticatedAuthNotifier {
   int imports = 0;
 
   @override
-  Future<void> authenticateWithCommunity(Community community) async {
+  Future<void> authenticateWithCommunity(
+    Community community, {
+    bool Function()? shouldContinue,
+    bool activate = true,
+  }) async {
+    if (shouldContinue != null && !shouldContinue()) return;
     imports += 1;
   }
 }

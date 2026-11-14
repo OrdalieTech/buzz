@@ -67,9 +67,7 @@ mod postgres_tests {
             .await
             .ok()?;
         let db = buzz_db::Db::from_pool(pool.clone());
-        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
-            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
-            .ok()?;
+        let redis_pool = buzz_pubsub::redis_connection(&config.redis_url).ok()?;
         let pubsub = Arc::new(
             buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
                 .await
@@ -243,9 +241,7 @@ mod postgres_tests {
             .await
             .ok()?;
         let db = buzz_db::Db::from_pool(pool.clone());
-        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
-            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
-            .ok()?;
+        let redis_pool = buzz_pubsub::redis_connection(&config.redis_url).ok()?;
         let pubsub = Arc::new(
             buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
                 .await
@@ -344,9 +340,7 @@ mod postgres_tests {
             .await
             .ok()?;
         let db = buzz_db::Db::from_pool(pool.clone());
-        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
-            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
-            .ok()?;
+        let redis_pool = buzz_pubsub::redis_connection(&config.redis_url).ok()?;
         let pubsub = Arc::new(
             buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
                 .await
@@ -1190,9 +1184,7 @@ mod external_infra {
             if std::env::var("BUZZ_TEST_SCHEMA_MODE").as_deref() != Ok("desired") {
                 db.migrate().await.unwrap();
             }
-            let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
-                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
-                .unwrap();
+            let redis_pool = buzz_pubsub::redis_connection(&config.redis_url).unwrap();
             let pubsub = Arc::new(
                 buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
                     .await
@@ -1344,6 +1336,9 @@ mod external_infra {
                 &self.owner.public_key().to_hex(),
                 &self.repo,
                 &super::super::super::cas_publish::ParentState::fresh(),
+                &super::super::super::cas_publish::snapshot_workspace(&source)
+                    .await
+                    .unwrap(),
                 limits(0),
             )
             .await
@@ -1808,6 +1803,9 @@ mod external_infra {
             &f.owner.public_key().to_hex(),
             &f.repo,
             &parent,
+            &super::super::super::cas_publish::snapshot_workspace(push.path())
+                .await
+                .unwrap(),
             limits(push.hydrated_bytes()),
         )
         .await;
@@ -1835,6 +1833,9 @@ mod external_infra {
             &f.owner.public_key().to_hex(),
             &f.repo,
             &parent,
+            &super::super::super::cas_publish::snapshot_workspace(push.path())
+                .await
+                .unwrap(),
             limits(push.hydrated_bytes()),
         )
         .await
@@ -1885,6 +1886,9 @@ mod external_infra {
             &f.owner.public_key().to_hex(),
             &f.repo,
             &parent,
+            &super::super::super::cas_publish::snapshot_workspace(push.path())
+                .await
+                .unwrap(),
             limits(push.hydrated_bytes()),
         )
         .await
@@ -1911,6 +1915,9 @@ mod external_infra {
             &f.owner.public_key().to_hex(),
             &f.repo,
             &parent,
+            &super::super::super::cas_publish::snapshot_workspace(push.path())
+                .await
+                .unwrap(),
             limits(push.hydrated_bytes()),
         )
         .await
